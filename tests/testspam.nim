@@ -1,20 +1,18 @@
-import imap, os, asyncdispatch
+import imap
 
 const
   hostname = "imap.spam.works"
   user = "test@spam.works"
   pass = "Abcd1234."
 
-proc main() {.async.} =
+proc main() =
   proc reportStatus(stat: Status) =
-    echo "--- ", stat, " ---"
+    echo "--- exists=", stat.exists, " recent=", stat.recent, " ---"
 
   let imap = newImapClient(reportStatus)
-  await imap.connect(hostname, imapPort, user, pass)
-  asyncCheck imap.process
-  block:
-    await imap.select("inbox")
-  while true:
-    await imap.idle()
+  imap.connect(hostname, imapPort, user, pass)
+  let info = imap.select("inbox")
+  echo "inbox: ", info.exists, " messages"
+  imap.close()
 
-waitFor main()
+main()

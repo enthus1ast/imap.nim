@@ -1,340 +1,598 @@
-import net, strutils, asyncnet, asyncFutures, asyncdispatch, strscans, tables, deques, parseutils, strformat
+## Synchronous IMAP4rev1 / IMAP4rev2 client library.
+##
+## This is a small, blocking IMAP client built on top of the standard `net`
+## module.  It speaks implicit TLS by default (port 993), so it must be
+## compiled with `-d:ssl`:
+##
+##   nim c -d:ssl your_program.nim
+##
+## Minimal example:
+##
+##   import imap
+##
+##   let client = newImapClient()
+##   client.connect("mail.example.org", imapPort, "user", "password")
+##   let info = client.select("INBOX")
+##   echo "messages: ", info.exists
+##   for n in client.search("ALL"):
+##     echo client.fetch(n, "ENVELOPE")
+##   client.close()
 
-export Port
+import net, strutils, strscans, strformat, parseutils
 
 when not defined(ssl):
   {.error: "IMAP client requires -d:ssl".}
 
 const
   imapPort* = 993.Port
-  CRLF* = "\c\L"
-  Debugging = defined(debugImap)
+  CRLF* = "\r\n"
 
 type
-  LineCallback = proc (line: string): bool
-
   Status* = object
-    ## Mailbox status report
+    ## Mailbox size summary reported through `StatusCallback`.
     exists*: int
     recent*: int
 
   StatusCallback* = proc (st: Status)
 
+  SelectInfo* = object
+    ## Result of a successful SELECT or EXAMINE command.
+    exists*: int
+    recent*: int
+    flags*: seq[string]
+    permanentFlags*: seq[string]
+    uidValidity*: int
+    uidNext*: int
+    unseen*: int
+    readWrite*: bool
+
+  Mailbox* = object
+    ## A single mailbox returned by `list`.
+    attributes*: seq[string]
+    delim*: string
+    name*: string
+
+  MailboxStatus* = object
+    ## Result of a STATUS command.
+    name*: string
+    messages*: int
+    recent*: int
+    uidNext*: int
+    uidValidity*: int
+    unseen*: int
+
+  TaggedReply* = object
+    ## A tagged server completion response.
+    tag*: string
+    condition*: string          ## "OK", "NO", or "BAD"
+    text*: string
+    untagged*: seq[string]
+
+  ReplyError* = object of IOError
+    ## Raised when a command completes with NO or BAD.
+    tag*: string
+    condition*: string
+    text*: string
+
+  LineHandler = proc (line: string) {.closure.}
+
   ImapClient* = ref object
+    sock: Socket
     sslContext: SslContext
-    sock: AsyncSocket
-    tagAlloc: int16
-    tagCallbacks: Table[string, LineCallback]
-    anyCallbacks: Deque[LineCallback]
+    tagAlloc: int
     status: Status
     statCb: StatusCallback
+    greeting: string
 
-proc complete(st: Status): bool =
-  (-1 < st.exists) and (-1 < st.recent)
+# ---------------------------------------------------------------------------
+# String helpers
+# ---------------------------------------------------------------------------
 
-proc reset(st: var Status) =
-  st.exists = -1
-  st.recent = -1
+proc quoteAstring(s: string): string =
+  ## Quote `s` as an IMAP astring, escaping backslashes and double quotes.
+  result = "\""
+  for c in s:
+    if c == '\\' or c == '"':
+      result.add '\\'
+    result.add c
+  result.add '"'
+
+proc quoteMailbox(name: string): string =
+  ## Mailbox names are astrings.  Leave an already quoted name alone.
+  if name.len >= 2 and name[0] == '"' and name[^1] == '"':
+    return name
+  quoteAstring(name)
+
+proc skipSpaces(s: string; i: var int) =
+  while i < s.len and s[i] == ' ':
+    inc i
+
+proc parseQuoted(s: string; i: var int): string =
+  ## Parse a quoted string starting at s[i] == '"'.  Advances `i`.
+  inc i
+  result = ""
+  while i < s.len:
+    case s[i]
+    of '\\':
+      if i + 1 < s.len:
+        inc i
+        result.add s[i]
+        inc i
+      else:
+        inc i
+    of '"':
+      inc i
+      return
+    else:
+      result.add s[i]
+      inc i
+
+proc parseAstring(s: string; i: var int): string =
+  ## Parse an astring (quoted string or atom).  Advances `i`.
+  if i < s.len and s[i] == '"':
+    result = parseQuoted(s, i)
+  else:
+    let start = i
+    while i < s.len and s[i] != ' ' and s[i] != ')':
+      inc i
+    result = s[start ..< i]
+
+proc parenTokens(s: string): seq[string] =
+  ## Return the whitespace-separated tokens inside the first (...) group.
+  let start = s.find('(')
+  if start < 0:
+    return @[]
+  let close = s.find(')', start + 1)
+  if close < 0:
+    return @[]
+  result = s[start + 1 ..< close].splitWhitespace()
+
+proc literalLengthAtEnd(s: string): int =
+  ## If `s` ends with an IMAP literal marker "{n}", return n; otherwise -1.
+  if s.len < 3 or s[^1] != '}':
+    return -1
+  var open = s.len - 2
+  while open >= 0 and s[open] in {'0'..'9'}:
+    dec open
+  if open < 0 or s[open] != '{' or open == s.len - 2:
+    return -1
+  result = parseInt(s[open + 1 .. s.len - 2])
+
+# ---------------------------------------------------------------------------
+# Core protocol helpers
+# ---------------------------------------------------------------------------
+
+proc newImapClient*(cb: StatusCallback = nil): ImapClient =
+  ## Create a new IMAP client.  `cb` (optional) is called whenever both a
+  ## message count (EXISTS) and a recent count (RECENT) have been observed.
+  result = ImapClient(
+    sock: newSocket(),
+    sslContext: net.newContext(verifyMode = CVerifyNone),
+    statCb: cb)
+  wrapSocket(result.sslContext, result.sock)
+  result.status = Status(exists: -1, recent: -1)
 
 proc nextTag(imap: ImapClient): string =
   inc imap.tagAlloc
-  toHex(imap.tagAlloc, 4)
+  "A" & $imap.tagAlloc
 
-proc finished(st: Status): bool =
-  st.exists > -1 and st.recent > -1
-
-proc newImapClient*(cb: StatusCallback): ImapClient =
-  ## Create a new Imap instance
-  result = ImapClient(
-    sslContext: net.newContext(verifyMode = CVerifyNone),
-    sock: newAsyncSocket(),
-    tagCallbacks: initTable[string, LineCallback](4),
-    anyCallbacks: initDeque[LineCallback](4),
-    statCb: cb)
-  wrapSocket(result.sslContext, result.sock)
-  reset result.status
-
-type
-  ReplyError* = object of IOError
-
-proc quitExcpt(imap: ImapClient, msg: string) =
-  when Debugging:
-    echo "C: QUIT"
-  discard imap.sock.send("QUIT")
-  raise newException(ReplyError, msg)
-
-proc checkOk(imap: ImapClient, tag = "*") {.async.} =
-  var line = await imap.sock.recvLine()
-  when Debugging:
-    echo "S: ",line
-  let elems = line.split(' ', 2)
-  if elems.len == 3 and elems[0] == tag:
-    case elems[1]:
-      of "OK":
-        return
-      of "NO":
-        quitExcpt(imap, elems[2])
-      else:
-        discard
-  quitExcpt(imap, fmt"Expected OK, got: {line} - {$elems}")
-
-proc assertOk(imap: ImapClient; line: string; tag = "*") =
-  let elems = line.split(' ', 2)
-  if elems.len == 3:
-    case elems[1]:
-      of "OK":
-        return
-      of "NO":
-        quitExcpt(imap, elems[2])
-      else:
-        discard
-  quitExcpt(imap, fmt"Expected OK, got: {line} - {$elems}")
-
-proc sendLine(imap: ImapClient; line: string): Future[void] =
-  when Debugging:
-    echo "C: ", line
+proc sendLine(imap: ImapClient; line: string) =
   imap.sock.send(line & CRLF)
 
-proc sendTag(imap: ImapClient; cb: LineCallback; cmd: string): Future[void] =
-  let tag = imap.nextTag
-  imap.tagCallbacks[tag] = cb
-  imap.sendLine(fmt"{tag} {cmd}")
+proc statusFromUntagged(imap: ImapClient; line: string) =
+  var n: int
+  if line.scanf("* $i EXISTS", n):
+    imap.status.exists = n
+  elif line.scanf("* $i RECENT", n):
+    imap.status.recent = n
+  if imap.status.exists >= 0 and imap.status.recent >= 0:
+    if imap.statCb != nil:
+      imap.statCb(imap.status)
+    imap.status.exists = -1
+    imap.status.recent = -1
 
-proc dispatchLine(imap: ImapClient; line: string) {.async.} =
-  when Debugging:
-    echo "S: ", line
-
-proc sendCmd*(imap: ImapClient, cmd: string, args = "") {.async.} =
-  let tag = imap.nextTag
-  await imap.sendLine(fmt"{tag} {cmd} {args}")
-  let
-    completion = tag & " OK"
-    no = tag & " NO"
-    bad = tag & " BAD"
+proc readReply(imap: ImapClient; tag: string; onUntagged: LineHandler = nil): TaggedReply =
+  ## Read server responses until the tagged completion line for `tag`.
+  ## Each untagged "*" line is passed to `onUntagged` and remembered in
+  ## `result.untagged`.
+  result.tag = tag
+  result.untagged = @[]
   while true:
-    let line = await imap.sock.recvLine()
+    let line = imap.sock.recvLine()
     if line.len == 0:
-      break
-    when Debugging:
-      echo "S: ", line
-    if line.startsWith(completion) or line.startsWith(no):
-      break
-    if line.startsWith(bad):
       imap.sock.close()
-      raise newException(IOError, line)
+      raise newException(IOError, "Connection closed while awaiting " & tag & " reply")
+    if line[0] == '*':
+      result.untagged.add line
+      if onUntagged != nil:
+        onUntagged(line)
+      imap.statusFromUntagged(line)
+    elif line[0] == '+':
+      # Command continuation request.  Normal commands do not expect these;
+      # APPEND handles them separately.
+      discard
     else:
-      await imap.dispatchLine(line)
+      var rtag = ""
+      let n = line.parseUntil(rtag, ' ')
+      if n > 0 and rtag == tag:
+        let rest = line.substr(n + 1)
+        let sp = rest.find(' ')
+        if sp < 0:
+          result.condition = rest
+          result.text = ""
+        else:
+          result.condition = rest[0 ..< sp]
+          result.text = rest[sp + 1 .. ^1]
+        return
+      # A tagged reply for another tag; ignore it.
 
-proc sendCmd(imap: ImapClient; cmd, args: string, op: LineCallback) {.async.} =
-  let tag = imap.nextTag
-  await imap.sendLine(fmt"{tag} {cmd} {args}")
-  let
-    completion = tag & " OK"
-    no = tag & " NO"
-    bad = tag & " BAD"
-  while true:
-    let line = await imap.sock.recvLine()
-    if line.len == 0:
-      break
-    when Debugging:
-      echo "S: ", line
-    if line.startsWith(completion) or line.startsWith(no):
-      break
-    if line.startsWith(bad):
-      imap.sock.close()
-      raise newException(IOError, line)
-    else:
-      if not op(line):
-        await imap.dispatchLine(line)
-
-proc sendAny(imap: ImapClient; cb: LineCallback; cmd: string, args = ""): Future[void] =
-  let tag = imap.nextTag
-  imap.anyCallbacks.addLast cb
-  if args == "":
+proc command(imap: ImapClient; cmd: string; args = ""; onUntagged: LineHandler = nil): TaggedReply =
+  let tag = imap.nextTag()
+  if args.len == 0:
     imap.sendLine(fmt"{tag} {cmd}")
   else:
     imap.sendLine(fmt"{tag} {cmd} {args}")
+  result = imap.readReply(tag, onUntagged)
 
-proc connect*(imap: ImapClient; host: string, port = imapPort) {.async} =
-  ## Establish a connection to an IMAP server
-  await imap.sock.connect(host, port)
-  await imap.checkOk()
+proc checkOk*(reply: TaggedReply) =
+  ## Raise `ReplyError` unless `reply.condition == "OK"`.
+  if reply.condition != "OK":
+    var e = newException(ReplyError, reply.condition & " " & reply.text)
+    e.tag = reply.tag
+    e.condition = reply.condition
+    e.text = reply.text
+    raise e
 
-proc authenticate*(imap: ImapClient; user, pass: string) {.async.} =
-  ## Authenticate to an IMAP server
-  await imap.sendCmd("LOGIN", fmt"{user} {pass}")
+# ---------------------------------------------------------------------------
+# Connection and authentication
+# ---------------------------------------------------------------------------
 
-proc connect*(imap: ImapClient; host: string; port: Port; user, pass: string) {.async.} =
-  ## Connect and authenticate to an IMAP server
-  await imap.connect(host, port)
-  await imap.authenticate(user, pass)
+proc connect*(imap: ImapClient; host: string; port = imapPort; timeout = -1) =
+  ## Connect to an IMAP server and read its greeting.
+  if timeout >= 0:
+    imap.sock.connect(host, port, timeout)
+  else:
+    imap.sock.connect(host, port)
+  imap.greeting = imap.sock.recvLine()
+  if imap.greeting.len == 0:
+    imap.sock.close()
+    raise newException(IOError, "No greeting from IMAP server")
+  if not (imap.greeting.startsWith("* OK") or imap.greeting.startsWith("* PREAUTH")):
+    raise newException(ReplyError, "Unexpected server greeting: " & imap.greeting)
 
-proc close*(imap: ImapClient) {.async.} =
-  ## Disconnects from the SMTP server and closes the socket.
-  await imap.sendCmd("LOGOUT")
-  close imap.sock
-  destroyContext imap.sslContext
+proc login*(imap: ImapClient; user, pass: string) =
+  ## Authenticate using the LOGIN command.  Prefer TLS (the default port 993).
+  let reply = imap.command("LOGIN", quoteAstring(user) & " " & quoteAstring(pass))
+  checkOk(reply)
 
-proc noop*(imap: ImapClient) {.async.} =
-  ## The NOOP command always succeeds.  It does nothing.
-  ##
-  ## Since any command can return a status update as untagged data, the
-  ## NOOP command can be used as a periodic poll for new messages or
-  ## message status updates during a period of inactivity (this is the
-  ## preferred method to do this). The NOOP command can also be used
-  ## to reset any inactivity autologout timer on the server.
-  await imap.sendCmd("NOOP")
+proc authenticate*(imap: ImapClient; user, pass: string) =
+  ## Alias for `login`.
+  imap.login(user, pass)
 
-proc create*(imap: ImapClient; name: string) {.async.} =
-  await imap.sendCmd(fmt"CREATE {name}")
+proc connect*(imap: ImapClient; host: string; port: Port; user, pass: string) =
+  ## Connect and authenticate in one step.
+  imap.connect(host, port)
+  imap.login(user, pass)
 
-proc store*(imap: ImapClient; uid: int, flags: string) {.async.} =
-  await imap.sendCmd(fmt"STORE {$uid} {flags}")
+proc logout*(imap: ImapClient) =
+  ## Send LOGOUT and close the connection.  Errors are ignored so this is
+  ## safe to call from a `finally`-like cleanup path.
+  try:
+    discard imap.command("LOGOUT")
+  except:
+    discard
+  imap.sock.close()
+  imap.sslContext.destroyContext()
 
-proc examine*(imap: ImapClient; name: string): Future[void] =
-  ## The EXAMINE command is identical to SELECT and returns the same
-  ## output; however, the selected mailbox is identified as read-only.
-  let
-    recv = newFuture[void]()
-    cb = proc (line: string): bool =
-      imap.assertOk(line)
-      recv.complete()
-      true
-    send = imap.sendTag(cb, fmt"EXAMINE {name}")
-  all(send, recv)
+proc close*(imap: ImapClient) =
+  ## Alias for `logout`.
+  imap.logout()
 
-proc select*(imap: ImapClient; name: string): Future[void] =
-  ## The SELECT command selects a mailbox so that messages in the
-  ## mailbox can be accessed.
-  let
-    recv = newFuture[void]()
-    cb = proc (line: string): bool =
-      imap.assertOk(line)
-      recv.complete()
-      true
-    send = imap.sendTag(cb, fmt"SELECT {name}")
-  all(send, recv)
+# ---------------------------------------------------------------------------
+# Mailboxes
+# ---------------------------------------------------------------------------
 
-proc fetch*(imap: ImapClient; uid: int, items: string): Future[string] {.async.} =
-  ## The FETCH command retrieves data associated with a message in the
-  ## mailbox.
-  var
-    length: int
-    id: int
-    section: string
-    data: string
-    flags: string
-  let cb = proc(line: string): bool =
-    if scanf(line, "* $i FETCH ($+ {$i}", id, section, length):
-      if id != uid:
-        return
-    var line = waitFor imap.sock.recv(length)
-    when Debugging:
-      echo "S: ", line
-    data.add line
-    while true:
-      var line = waitFor imap.sock.recvLine()
-      if line.len == 0:
-        break
-      when Debugging:
-        echo "S: ", line
-      if line == ")":
-        break
-      elif scanf(line, " FLAGS ($+))$.", flags):
-        break
-      elif scanf(line, " $+ {$i}", section, length) and length >= 1:
-        var line = waitFor imap.sock.recv(length)
-        when Debugging:
-          echo "S: ", line
-        data.add line
+proc capability*(imap: ImapClient): seq[string] =
+  var caps = newSeq[string]()
+  let onUntagged = proc (line: string) =
+    if line.startsWith("* CAPABILITY"):
+      let rest = line.substr("* CAPABILITY".len).strip()
+      for cap in rest.splitWhitespace():
+        caps.add cap
+  let reply = imap.command("CAPABILITY", "", onUntagged)
+  checkOk(reply)
+  result = caps
 
-    true
-  await imap.sendCmd("FETCH", fmt"{$uid} {items}", cb)
-  return data
+proc noop*(imap: ImapClient) =
+  checkOk(imap.command("NOOP"))
 
-proc append*(imap: ImapClient, mailbox, flags, msg: string) {.async.} =
-  let tag = imap.nextTag
-  ## Append a new message to the end of the specified destination mailbox.
-  await imap.sendLine(fmt"{tag} APPEND {mailbox} {flags} {$msg.len}")
-  while true:
-    let line = await imap.sock.recvLine()
-    when Debugging:
-      echo "S: ", line
-    if not line.startswith("+"):
-      await imap.dispatchLine(line)
-    else:
-      when Debugging:
-        echo "C: ", msg
-      await imap.sock.send(msg)
-      await imap.sock.send(CRLF)
-      await imap.checkOk(tag)
-      return
+proc select*(imap: ImapClient; name: string): SelectInfo =
+  ## Select a mailbox and return its current state.
+  var info = SelectInfo(
+    exists: -1, recent: -1, uidValidity: -1, uidNext: -1, unseen: -1)
+  let onUntagged = proc (line: string) =
+    var n: int
+    if line.scanf("* $i EXISTS", n):
+      info.exists = n
+    elif line.scanf("* $i RECENT", n):
+      info.recent = n
+    elif line.startsWith("* FLAGS"):
+      info.flags = parenTokens(line)
+    elif line.startsWith("* OK [PERMANENTFLAGS"):
+      info.permanentFlags = parenTokens(line)
+    elif line.scanf("* OK [UIDVALIDITY $i]", n):
+      info.uidValidity = n
+    elif line.scanf("* OK [UIDNEXT $i]", n):
+      info.uidNext = n
+    elif line.scanf("* OK [UNSEEN $i]", n):
+      info.unseen = n
+  let reply = imap.command("SELECT", quoteMailbox(name), onUntagged)
+  checkOk(reply)
+  info.readWrite = reply.text.startsWith("[READ-WRITE]")
+  result = info
 
-proc search*(imap: ImapClient; spec: string): Future[seq[int]] {.async.} =
-  ## The SEARCH command searches the mailbox for messages that match
-  ## the given searching criteria.
-  var uids = newSeq[int]()
-  let op = proc(line: string): bool =
-    if line.startsWith("* SEARCH "):
-      let elems = line.split(' ')
-      uids.setLen(elems.len-2)
-      for i in 2..high(elems):
-        uids[i-2] = parseint elems[i]
-      result = true
-  imap.anyCallbacks.addLast op
-  await imap.sendCmd("SEARCH", spec)
-  return uids
+proc examine*(imap: ImapClient; name: string): SelectInfo =
+  ## Select a mailbox read-only.
+  var info = SelectInfo(
+    exists: -1, recent: -1, uidValidity: -1, uidNext: -1, unseen: -1)
+  let onUntagged = proc (line: string) =
+    var n: int
+    if line.scanf("* $i EXISTS", n):
+      info.exists = n
+    elif line.scanf("* $i RECENT", n):
+      info.recent = n
+    elif line.startsWith("* FLAGS"):
+      info.flags = parenTokens(line)
+    elif line.startsWith("* OK [PERMANENTFLAGS"):
+      info.permanentFlags = parenTokens(line)
+    elif line.scanf("* OK [UIDVALIDITY $i]", n):
+      info.uidValidity = n
+    elif line.scanf("* OK [UIDNEXT $i]", n):
+      info.uidNext = n
+    elif line.scanf("* OK [UNSEEN $i]", n):
+      info.unseen = n
+  let reply = imap.command("EXAMINE", quoteMailbox(name), onUntagged)
+  checkOk(reply)
+  info.readWrite = false
+  result = info
 
-proc process*(imap: ImapClient): Future[void] {.async.} =
-  ## Process messages from the IMAP server
-  ## until the connection is closed.
-  while not imap.sock.isClosed:
-    let line = await imap.sock.recvLine()
-    if line.len == 0:
-      break
+proc create*(imap: ImapClient; name: string) =
+  checkOk(imap.command("CREATE", quoteMailbox(name)))
 
-    when Debugging:
-      echo "S: ", line
-    if line[0] == '*':
-      for _ in 1..imap.anyCallbacks.len:
-        let cb = imap.anyCallbacks.popFirst()
-        if not cb(line):
-          imap.anyCallbacks.addLast cb
-      var n = -1
-      if scanf(line, "* $i EXISTS", n):
-        if n != imap.status.exists:
-          imap.status.exists = n
-      if scanf(line, "* $i RECENT", n):
-        if n != imap.status.recent:
-          imap.status.recent = n
-      if imap.status.complete:
-        imap.statCb(imap.status)
-        reset imap.status
-    else:
-      var tag = newStringOfCap(4)
-      if line.parseUntil(tag, ' ') > 0:
-        let cb = imap.tagCallbacks.getOrDefault(tag)
-        if not cb.isNil and cb(line):
-          imap.tagCallbacks.del(tag)
-        else:
-          if line.startsWith(fmt"{tag} BAD"):
-            raise newException(IOError, line)
+proc delete*(imap: ImapClient; name: string) =
+  checkOk(imap.command("DELETE", quoteMailbox(name)))
 
-proc idle*(imap: ImapClient): Future[void] {.async.} =
-  var stat = Status(exists: -1, recent: -1)
-  let
-    fut = newFuture[void]()
-    cb = proc (line: string): bool =
-      var n: int
-      if scanf(line, "* $i EXISTS", n):
-        stat.exists = n
-      elif scanf(line, "* $i RECENT", n):
-        stat.recent = n
-      if stat.finished:
-        fut.complete()
-        result = true # idle complete
-  while true:
-    await imap.sendAny(cb, "IDLE")
-    let done = await withTimeout(fut, 29 * 60 * 1000)
-    await imap.sendLine("DONE")
-    if done: break
+proc rename*(imap: ImapClient; oldName, newName: string) =
+  checkOk(imap.command("RENAME", quoteMailbox(oldName) & " " & quoteMailbox(newName)))
+
+proc subscribe*(imap: ImapClient; name: string) =
+  checkOk(imap.command("SUBSCRIBE", quoteMailbox(name)))
+
+proc unsubscribe*(imap: ImapClient; name: string) =
+  checkOk(imap.command("UNSUBSCRIBE", quoteMailbox(name)))
+
+proc list*(imap: ImapClient; refName = ""; pattern = "*"): seq[Mailbox] =
+  ## Return mailboxes matching `pattern` (LIST command).
+  var boxes = newSeq[Mailbox]()
+  let onUntagged = proc (line: string) =
+    if line.startsWith("* LIST"):
+      var box = Mailbox()
+      var i = "* LIST".len
+      skipSpaces(line, i)
+      if i < line.len and line[i] == '(':
+        box.attributes = parenTokens(line[i .. ^1])
+        let close = line.find(')', i)
+        if close >= 0:
+          i = close + 1
+      skipSpaces(line, i)
+      box.delim = parseAstring(line, i)
+      if box.delim == "NIL":
+        box.delim = ""
+      skipSpaces(line, i)
+      box.name = parseAstring(line, i)
+      boxes.add box
+  let reply = imap.command("LIST", quoteMailbox(refName) & " " & quoteMailbox(pattern), onUntagged)
+  checkOk(reply)
+  result = boxes
+
+proc status*(imap: ImapClient; name: string;
+             items = "(MESSAGES RECENT UIDNEXT UIDVALIDITY UNSEEN)"): MailboxStatus =
+  ## Query mailbox status without selecting it.
+  var st = MailboxStatus(
+    name: name, messages: -1, recent: -1, uidNext: -1, uidValidity: -1, unseen: -1)
+  let onUntagged = proc (line: string) =
+    if line.startsWith("* STATUS"):
+      var i = "* STATUS".len
+      skipSpaces(line, i)
+      let mailboxName = parseAstring(line, i)
+      if mailboxName.len > 0:
+        st.name = mailboxName
+      skipSpaces(line, i)
+      if i < line.len and line[i] == '(':
+        let toks = parenTokens(line[i .. ^1])
+        var j = 0
+        while j + 1 < toks.len:
+          let key = toks[j].toUpperAscii()
+          let value = try: parseInt(toks[j + 1]) except ValueError: -1
+          case key
+          of "MESSAGES": st.messages = value
+          of "RECENT": st.recent = value
+          of "UIDNEXT": st.uidNext = value
+          of "UIDVALIDITY": st.uidValidity = value
+          of "UNSEEN": st.unseen = value
+          else: discard
+          j += 2
+  let reply = imap.command("STATUS", quoteMailbox(name) & " " & items, onUntagged)
+  checkOk(reply)
+  result = st
+
+# ---------------------------------------------------------------------------
+# Messages
+# ---------------------------------------------------------------------------
+
+proc parseFetchLine(line: string; seqNum: var int; rest: var string): bool =
+  ## Parse "* <n> FETCH <rest>".  Returns false on mismatch.
+  if not line.startsWith("* "):
+    return false
+  var i = 2
+  while i < line.len and line[i] in {'0'..'9'}:
+    inc i
+  if i == 2:
+    return false
+  seqNum = parseInt(line[2 ..< i])
+  const prefix = " FETCH "
+  if i + prefix.len > line.len or line.substr(i, i + prefix.len - 1) != prefix:
+    return false
+  rest = line.substr(i + prefix.len)
+  result = true
+
+proc readLiteralBytes(imap: ImapClient; n: int): string =
+  result = newStringOfCap(n)
+  var left = n
+  while left > 0:
+    let chunk = imap.sock.recv(left)
+    if chunk.len == 0:
+      raise newException(IOError, "Connection closed while reading literal")
+    result.add chunk
+    left -= chunk.len
+
+proc readFetchPayload(imap: ImapClient; payload: string): string =
+  ## Given the text after "FETCH " in an untagged FETCH line, inline any
+  ## trailing literal and its closing line.
+  result = payload
+  let lit = literalLengthAtEnd(payload)
+  if lit >= 0:
+    result.add imap.readLiteralBytes(lit)
+    result.add imap.sock.recvLine()
+
+proc fetch*(imap: ImapClient; seqNum: int; items: string): string =
+  ## FETCH `items` for the message with sequence number `seqNum` and return
+  ## the reconstructed untagged FETCH payload.
+  var data = ""
+  let onUntagged = proc (line: string) =
+    var seq: int
+    var rest: string
+    if parseFetchLine(line, seq, rest) and seq == seqNum:
+      data.add imap.readFetchPayload(rest)
+  let reply = imap.command("FETCH", $seqNum & " " & items, onUntagged)
+  checkOk(reply)
+  result = data
+
+proc payloadUid(payload: string): int =
+  ## Extract the first "UID <n>" value from a FETCH payload, or -1.
+  let idx = payload.find("UID ")
+  if idx < 0:
+    return -1
+  var i = idx + 4
+  while i < payload.len and payload[i] in {'0'..'9'}:
+    inc i
+  if i == idx + 4:
+    return -1
+  result = parseInt(payload[idx + 4 ..< i])
+
+proc uidFetch*(imap: ImapClient; uid: int; items: string): string =
+  ## `UID FETCH` for the message with the given unique identifier.
+  var data = ""
+  let onUntagged = proc (line: string) =
+    var seq: int
+    var rest: string
+    if parseFetchLine(line, seq, rest) and payloadUid(rest) == uid:
+      data.add imap.readFetchPayload(rest)
+  let reply = imap.command("UID", "FETCH " & $uid & " " & items, onUntagged)
+  checkOk(reply)
+  result = data
+
+proc expandEsearchAll(line: string): seq[int] =
+  ## Best-effort parse of an ESEARCH "ALL ..." result (rev2 servers).
+  result = @[]
+  let idx = line.find(" ALL ")
+  if idx < 0:
+    return
+  let rest = line.substr(idx + " ALL ".len).strip()
+  if rest.len == 0:
+    return
+  for part in rest.split(','):
+    let bounds = part.split(':')
+    if bounds.len == 1:
+      try:
+        result.add parseInt(bounds[0])
+      except ValueError:
+        discard
+    elif bounds.len == 2:
+      try:
+        let a = parseInt(bounds[0])
+        let b = parseInt(bounds[1])
+        for n in a .. b:
+          result.add n
+      except ValueError:
+        discard
+
+proc search*(imap: ImapClient; spec: string): seq[int] =
+  ## Search the selected mailbox and return matching message sequence numbers.
+  ## Handles both rev1 `* SEARCH` and rev2 `* ESEARCH ... ALL` responses.
+  var nums = newSeq[int]()
+  let onUntagged = proc (line: string) =
+    if line.startsWith("* SEARCH"):
+      for tok in line.substr("* SEARCH".len).splitWhitespace():
+        try:
+          nums.add parseInt(tok)
+        except ValueError:
+          discard
+    elif line.startsWith("* ESEARCH"):
+      for n in expandEsearchAll(line):
+        nums.add n
+  let reply = imap.command("SEARCH", spec, onUntagged)
+  checkOk(reply)
+  result = nums
+
+proc uidSearch*(imap: ImapClient; spec: string): seq[int] =
+  ## UID SEARCH variant of `search`.
+  var nums = newSeq[int]()
+  let onUntagged = proc (line: string) =
+    if line.startsWith("* SEARCH"):
+      for tok in line.substr("* SEARCH".len).splitWhitespace():
+        try:
+          nums.add parseInt(tok)
+        except ValueError:
+          discard
+    elif line.startsWith("* ESEARCH"):
+      for n in expandEsearchAll(line):
+        nums.add n
+  let reply = imap.command("UID", "SEARCH " & spec, onUntagged)
+  checkOk(reply)
+  result = nums
+
+proc store*(imap: ImapClient; seqSet: string; data: string) =
+  checkOk(imap.command("STORE", seqSet & " " & data))
+
+proc uidStore*(imap: ImapClient; uidSet: string; data: string) =
+  checkOk(imap.command("UID", "STORE " & uidSet & " " & data))
+
+proc copy*(imap: ImapClient; seqSet: string; mailbox: string) =
+  checkOk(imap.command("COPY", seqSet & " " & quoteMailbox(mailbox)))
+
+proc uidCopy*(imap: ImapClient; uidSet: string; mailbox: string) =
+  checkOk(imap.command("UID", "COPY " & uidSet & " " & quoteMailbox(mailbox)))
+
+proc move*(imap: ImapClient; seqSet: string; mailbox: string) =
+  checkOk(imap.command("MOVE", seqSet & " " & quoteMailbox(mailbox)))
+
+proc uidMove*(imap: ImapClient; uidSet: string; mailbox: string) =
+  checkOk(imap.command("UID", "MOVE " & uidSet & " " & quoteMailbox(mailbox)))
+
+proc expunge*(imap: ImapClient) =
+  checkOk(imap.command("EXPUNGE"))
+
+proc append*(imap: ImapClient; mailbox, msg: string; flags = "") =
+  ## Append `msg` (a complete RFC 5322 message) to `mailbox`.
+  let tag = imap.nextTag()
+  var args = quoteMailbox(mailbox)
+  if flags.len > 0:
+    args.add " " & flags
+  args.add " {" & $msg.len & "}"
+  imap.sendLine(fmt"{tag} APPEND {args}")
+  let cont = imap.sock.recvLine()
+  if cont.len == 0 or cont[0] != '+':
+    raise newException(ReplyError, "APPEND continuation expected, got: " & cont)
+  imap.sock.send(msg & CRLF)
+  checkOk(imap.readReply(tag))
